@@ -16,14 +16,19 @@ from datetime import datetime
 import functools
 import os
 import time
+import random
+from urllib.request import urlretrieve
 
+from gevent import monkey; monkey.patch_all()
+import gevent
+from gevent.pool import Pool
 
 import requests
 from lxml import etree
-from gevent.pool import Pool
+from tqdm import tqdm
 
 # data path
-from config import DATA_PATH, RAW_PATH, set_mongo
+from config import DATA_PATH, RAW_PATH, set_mongo, IP_POOL
 
 
 # -- tool functions --
@@ -68,11 +73,8 @@ def save_urls(urls, collection):
 
 def update_used_ids(idcol, datacol):
     docs = datacol.find({}, ['_id'])
-    usedIDs = []
     for doc in docs:
-        usedIDs.append({'url': doc['_id']})
-    result = idcol.update_many({'_used':0, '$or': usedIDs}, {'$inc': {'_used': 1}})
-    print('Updated %d IDs'%(result.modified_count))
+        idcol.update_one({'url': doc['_id'],'_used':0,}, {'$inc': {'_used': 1}})
 
 
 def read_urls(collection):
@@ -89,7 +91,10 @@ def parse_novelinfo(id):
 
     info = {'_id': id, '_raw': 0}
 
-    name = html.xpath('//*[@id="downInfoArea"]/h1/font/b/text()')[0]
+    try:
+        name = html.xpath('//*[@id="downInfoArea"]/h1/font/b/text()')[0]
+    except IndexError:
+        return None
     info['书籍名称'] = name
 
     cat = html.xpath('//*[@class="crumbleft"]/a[2]/text()')[0]
@@ -124,15 +129,8 @@ def save_novelinfo(docs, collection):
 
 
 def update_file_record(collection):
-    cond = []
     for fname in os.listdir(RAW_PATH):
-        cond.append({'_id': os.path.splitext(fname)[0]})
-
-    if not cond:
-        return None
-
-    result = collection.update_many({'_raw': 0, '$or': cond}, {'$inc': {'_raw': 1}})
-    print('Updated %d info of novels' %(result.modified_count))
+        collection.update_one({'_id': os.path.splitext(fname)[0], '_raw': 0}, {'$inc': {'_raw': 1}})
 
 
 def get_raw_urls(collection):
@@ -143,19 +141,59 @@ def get_raw_urls(collection):
 
 def download_novel(doc):
     url = doc['下载链接']
-    fname = doc['_id']+'.rar'
+    id = doc['_id']
+    fname = id+'.rar'
     path = os.path.join(RAW_PATH, fname)
 
+    headers = {
+'Host': 'www.qswtxt.com',
+'Connection': 'keep-alive',
+'Cache-Control': 'max-age=0',
+'Upgrade-Insecure-Requests': '1',
+'User-Agent': 'Mozilla/5.0 (compatible; MSIE 9.0; Windows NT 6.1; WOW64; Trident/5.0; SLCC2; .NET CLR 2.0.50727; .NET CLR 3.5.30729; .NET CLR 3.0.30729; Media Center PC 6.0; .NET4.0C; .NET4.0E; QQBrowser/7.0.3698.400)',
+'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+'Accept-Encoding': 'gzip, deflate',
+'Accept-Language': 'zh-CN,zh;q=0.8',
+    }
+    ip = random.choice(IP_POOL)
+    proxies = {'http':ip}
+
     try:
+        # print("Requesting... %s"%(id))
         r = requests.get(url, timeout=5)
+        if r.status_code!='200':
+            print("Fail: %s"%url)
+            return None
     except Exception as e:
         print(e)
         return None
 
+    # print('Saving... %s'%(id))
     with open(path, 'wb') as fd:
         for chunk in r.iter_content(chunk_size=128):
             fd.write(chunk)
-    print('%s saved'%(fname))
+
+
+def cbk(a, b, c):
+    '''
+    回调函数 
+    @a: 已经下载的数据块 
+    @b: 数据块的大小 
+    @c: 远程文件的大小 
+    '''
+    per = 100.0 * a * b / c
+    if per > 100:
+        per = 100
+    print('%.2f%%'%per)
+
+
+def download_novel_2(doc):
+    url = doc['下载链接']
+    id = doc['_id']
+    fname = id + '.rar'
+
+    path = os.path.join(RAW_PATH, fname)
+    urlretrieve(url=url, filename=path)
 
 
 # -- work functions --
@@ -183,8 +221,11 @@ def save_novel_urls(page_urls, novel_urls):
 
 def save_info_unit(id, novel_urls, novel_info):
     try:
+
         print('begin: %s'%id)
         info = parse_novelinfo(id)
+        if info is None:
+            return None
         save_novelinfo(info, novel_info)
         print('end: %s' % id)
     except Exception as e:
@@ -194,25 +235,39 @@ def save_info_unit(id, novel_urls, novel_info):
 def save_novel_info(novel_urls, novel_info):
     update_used_ids(novel_urls, novel_info)
     ids = read_urls(novel_urls)
+
     print('Total Tasks: %d'%(len(ids)))
-    pool = Pool(10)
+    pbar = tqdm(total=len(ids))
     unit = functools.partial(save_info_unit, novel_urls=novel_urls, novel_info=novel_info)
+    pool = Pool(100)
     pool.map(unit, ids)
+    pbar.close()
 
 
 def save_novel_raw(novel_info):
     update_file_record(novel_info)
     urls = get_raw_urls(novel_info)
-    print('Total Raw: %d'%(len(urls)))
-    pool = Pool(10)
-    pool.map(download_novel, urls)
+
+    # pbar = tqdm(total=len(urls))
+    # pool = Pool(5)
+    # pool.map(download_novel, urls)
+    # pbar.close()
+    for url in tqdm(urls):
+        download_novel_2(url)
 
 
 def main():
-    page_urls, novel_urls, novel_info = set_mongo()
+    collections = set_mongo()
+    # page_urls = collections['page_urls']
+    # novel_urls = collections['novel_urls']
+    novel_info = collections['novel_info']
+
+    # finished steps
     # save_page_urls(page_urls, novel_urls)
     # save_novel_urls(page_urls, novel_urls)
-    save_novel_info(novel_urls, novel_info)
+    # save_novel_info(novel_urls, novel_info)
+
+    # current steps
     save_novel_raw(novel_info)
 
 

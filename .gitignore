@@ -1,0 +1,7 @@
+*.pyc
+*.log
+download/mytestfun.py
+download/download.py
+download.csv
+download.zip
+novel_recommmeder.log
